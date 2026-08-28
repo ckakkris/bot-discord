@@ -1,14 +1,24 @@
-// Content Script - Runs on Spotify pages.
+(() => {
+  if (globalThis.__spotifyLyricsContentScriptLoaded) {
+    return;
+  }
+
+  globalThis.__spotifyLyricsContentScriptLoaded = true;
+
+  // Content Script - Runs on Spotify pages.
 // Reads Spotify DOM state and reports playback/lyric changes to the extension.
 
 const ACTIONS = {
   TRACK_CHANGED: 'trackChanged',
-  LYRIC_CHANGED: 'currentLyricChanged'
+  LYRIC_CHANGED: 'currentLyricChanged',
+  PLAYBACK_CHANGED: 'playbackChanged',
+  REQUEST_LYRICS: 'requestLyrics'
 };
 
 const SELECTORS = {
   playPauseButton: '[data-testid="control-button-playpause"]',
   lyricLine: '[data-testid="lyrics-line"]',
+  playbackProgress: '[data-testid="playback-progressbar"]',
   lyricTextFallback: '.WnslfFBWTgOIUgNH',
   contextArtist: '[data-testid="context-item-info-artist"]',
   contextTitle: 'h1[data-testid="context-item-info-title"]',
@@ -16,6 +26,7 @@ const SELECTORS = {
 };
 
 const COMPLETED_LYRIC_CLASS = 'loNizikBbaCKyI9Gv8xg';
+const CURRENT_LYRIC_CLASS = 'dPaa_Hg0z0Ql_UBrV9uZ';
 
 const INTERVALS = {
   lyricTrackingMs: 300,
@@ -28,10 +39,21 @@ const MUSIC_NOTE_TEXT = '\u266a';
 let lastReportedLyric = '';
 let lastReportedLyrics = '';
 let lastReportedTrack = null;
+let lastReportedPlayingState = null;
 let extensionContextActive = true;
 const observerIntervalIds = [];
 
 startSpotifyObservers();
+
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message?.action !== ACTIONS.REQUEST_LYRICS) {
+    return false;
+  }
+
+  const snapshot = collectLyricsSnapshot();
+  sendResponse(snapshot);
+  return false;
+});
 
 function startSpotifyObservers() {
   observerIntervalIds.push(
@@ -45,31 +67,78 @@ function reportCurrentLyricIfChanged() {
     return;
   }
 
-  if (!isSpotifyPlaying()) {
+  const playing = isSpotifyPlaying();
+  const snapshot = collectLyricsSnapshot();
+  const finished = !playing && isLyricsFinished(snapshot);
+
+  if (!playing && !finished && playing !== lastReportedPlayingState) {
+    lastReportedPlayingState = playing;
+    safeSendMessage({
+      action: ACTIONS.PLAYBACK_CHANGED,
+      playing
+    });
+  }
+
+  if (!playing && !finished) {
     return;
   }
 
-  const lyrics = getAllLyrics();
-  const currentLyric = findCurrentLyric();
+  const { lyrics, currentLyric } = snapshot;
+  const lyricToReport = currentLyric || (lyrics ? MUSIC_NOTE_TEXT : '');
 
-  if (!currentLyric && !lyrics) {
+  if (!lyricToReport && !lyrics) {
     return;
   }
 
-  const lyricChanged = currentLyric && currentLyric !== lastReportedLyric;
+  const lyricChanged = lyricToReport && lyricToReport !== lastReportedLyric;
   const lyricsChanged = lyrics && lyrics !== lastReportedLyrics;
 
   if (!lyricChanged && !lyricsChanged) {
     return;
   }
 
-  lastReportedLyric = currentLyric || lastReportedLyric;
+  lastReportedLyric = lyricToReport || lastReportedLyric;
   lastReportedLyrics = lyrics || lastReportedLyrics;
   safeSendMessage({
     action: ACTIONS.LYRIC_CHANGED,
-    lyric: currentLyric,
+    lyric: lyricToReport,
     lyrics: lastReportedLyrics
   });
+}
+
+function isLyricsFinished(snapshot) {
+  const lyricLines = Array.from(document.querySelectorAll(SELECTORS.lyricLine))
+    .filter((line) => isValidLyricText(getElementText(line.querySelector('div') || line)));
+
+  if (!lyricLines.length) {
+    return false;
+  }
+
+  const allLinesCompleted = lyricLines.every(isCompletedLyricLine);
+  const progressBar = document.querySelector(SELECTORS.playbackProgress);
+  const currentTime = Number(progressBar?.getAttribute('aria-valuenow'));
+  const duration = Number(progressBar?.getAttribute('aria-valuemax'));
+  const progressAtEnd = Number.isFinite(currentTime) &&
+    Number.isFinite(duration) &&
+    duration > 0 &&
+    currentTime >= duration - 1;
+
+  return allLinesCompleted || progressAtEnd;
+}
+
+function collectLyricsSnapshot() {
+  const lyricLines = Array.from(document.querySelectorAll(SELECTORS.lyricLine));
+  const fallbackLines = Array.from(document.querySelectorAll(SELECTORS.lyricTextFallback));
+  const lyrics = lyricLines
+    .map((line) => getElementText(line.querySelector('div') || line))
+    .filter(isValidLyricText)
+    .join('\n');
+  const currentLyric = findCurrentLyric();
+
+  return {
+    lyrics,
+    currentLyric,
+  };
 }
 
 function reportCurrentTrackIfChanged() {
@@ -95,8 +164,17 @@ function reportCurrentTrackIfChanged() {
 function isSpotifyPlaying() {
   const playPauseButton = document.querySelector(SELECTORS.playPauseButton);
   const ariaLabel = playPauseButton?.getAttribute('aria-label') || '';
+  const normalizedLabel = ariaLabel.toLowerCase();
 
-  return ariaLabel.toLowerCase() === 'pause';
+  if (normalizedLabel.includes('pause') || normalizedLabel.includes('\u0e2b\u0e22\u0e38\u0e14')) {
+    return true;
+  }
+
+  if (normalizedLabel.includes('play') || normalizedLabel.includes('\u0e40\u0e25\u0e48\u0e19')) {
+    return false;
+  }
+
+  return Boolean(document.querySelector(SELECTORS.lyricLine));
 }
 
 function findCurrentLyric() {
@@ -106,46 +184,11 @@ function findCurrentLyric() {
     return highlightedLyric;
   }
 
-  const lyricLines = Array.from(document.querySelectorAll(SELECTORS.lyricLine));
-
-  if (!lyricLines.length) {
-    return '';
-  }
-
-  const viewportTop = 0;
-  let bestLine = '';
-  let bestDistance = Infinity;
-
-  for (const line of lyricLines) {
-    const text = getElementText(line.querySelector('div') || line);
-
-    if (!isValidLyricText(text)) {
-      continue;
-    }
-
-    const rect = line.getBoundingClientRect();
-
-    if (rect.bottom <= viewportTop || rect.top >= window.innerHeight) {
-      continue;
-    }
-
-    const distance = Math.abs(Math.max(rect.top, viewportTop));
-
-    if (distance < bestDistance) {
-      bestDistance = distance;
-      bestLine = text;
-    }
-  }
-
-  return bestLine;
+  return '';
 }
 
 function getAllLyrics() {
-  const lines = Array.from(document.querySelectorAll(SELECTORS.lyricLine))
-    .map((line) => getElementText(line.querySelector('div') || line))
-    .filter(isValidLyricText);
-
-  return lines.join('\n');
+  return collectLyricsSnapshot().lyrics;
 }
 
 function getCurrentTrackInfo() {
@@ -175,9 +218,10 @@ function getCurrentTrackInfo() {
       artist = artist || nowPlaying.artist;
     }
 
-    return title && artist
+    const track = title && artist
       ? { title, artist, found: true }
-      : { title: '', artist: '', found: false, debug: pageTitle };
+      : { title: '', artist: '', found: false };
+    return track;
   } catch (error) {
     return {
       title: '',
@@ -194,15 +238,6 @@ function findHighlightedLyric() {
 
   if (highlightedLine) {
     return getElementText(highlightedLine.querySelector('div') || highlightedLine);
-  }
-
-  const firstUpcomingLine = lyricLines.find((line) => {
-    const textElement = line.querySelector('div') || line;
-    return !isCompletedLyricLine(line) && isValidLyricText(getElementText(textElement));
-  });
-
-  if (firstUpcomingLine) {
-    return getElementText(firstUpcomingLine.querySelector('div') || firstUpcomingLine);
   }
 
   const highlightedText = Array.from(document.querySelectorAll(SELECTORS.lyricTextFallback))
@@ -226,6 +261,10 @@ function isHighlightedLyricLine(line) {
   const activeClassPattern = /(active|current|highlight|selected|RL7r4lsMHxMySdFr)/i;
 
   if (activeClassPattern.test(line.className)) {
+    return true;
+  }
+
+  if (line.classList.contains(CURRENT_LYRIC_CLASS)) {
     return true;
   }
 
@@ -292,3 +331,4 @@ function stopSpotifyObservers() {
     clearInterval(observerIntervalIds.pop());
   }
 }
+})();

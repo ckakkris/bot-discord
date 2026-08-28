@@ -8,6 +8,7 @@ const lyricsOutput = document.getElementById('lyricsOutput');
 const loadLyricsBtn = document.getElementById('loadLyrics');
 const lyricsStatus = document.getElementById('lyricsStatus');
 const discordStatus = document.getElementById('discordStatus');
+const REQUEST_LYRICS_ACTION = 'requestLyrics';
 
 document.addEventListener('DOMContentLoaded', () => {
   loadSettings();
@@ -37,8 +38,19 @@ async function loadLyrics() {
   lyricsStatus.className = 'status-message';
 
   try {
-    const latestLyrics = await getLatestLyrics();
-    const currentLyric = await getCurrentLyric();
+    const scanResult = await requestLyricsFromSpotify();
+    let latestLyrics = scanResult?.lyrics || '';
+    let currentLyric = scanResult?.currentLyric || '';
+
+    if (latestLyrics) {
+      await saveLatestLyrics(latestLyrics);
+      if (currentLyric) {
+        await saveCurrentLyric(currentLyric);
+      }
+    } else {
+      latestLyrics = await getLatestLyrics();
+      currentLyric = await getCurrentLyric();
+    }
 
     if (!latestLyrics) {
       throw new Error('ยังไม่มีเนื้อเพลงที่อ่านได้');
@@ -55,6 +67,35 @@ async function loadLyrics() {
   } finally {
     loadLyricsBtn.disabled = false;
   }
+}
+
+async function requestLyricsFromSpotify() {
+  const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+  const activeTab = tabs[0];
+
+  if (!activeTab?.id || !activeTab.url?.startsWith('https://open.spotify.com/')) {
+    return { lyrics: '', currentLyric: '' };
+  }
+
+  try {
+    const response = await sendLyricsScanRequest(activeTab.id);
+    return response || { lyrics: '', currentLyric: '' };
+  } catch (error) {
+    try {
+      await chrome.scripting.executeScript({
+        target: { tabId: activeTab.id },
+        files: ['content.js']
+      });
+      const response = await sendLyricsScanRequest(activeTab.id);
+      return response || { lyrics: '', currentLyric: '' };
+    } catch (injectionError) {
+      return { lyrics: '', currentLyric: '' };
+    }
+  }
+}
+
+function sendLyricsScanRequest(tabId) {
+  return chrome.tabs.sendMessage(tabId, { action: REQUEST_LYRICS_ACTION });
 }
 
 async function saveDiscordSettings() {

@@ -12,15 +12,11 @@ const STORAGE_KEYS = {
 async function updateDiscordStatus(token, status) {
   const text = String(status || '').trim().slice(0, DISCORD_STATUS_LIMIT);
 
-  if (!text) {
-    return false;
-  }
-
   const response = await discordRequest(token, '/users/@me/settings', {
     method: 'PATCH',
     body: {
       custom_status: {
-        text,
+        text: text || null,
         emoji_id: null,
         emoji_name: null,
         expires_at: null
@@ -29,7 +25,7 @@ async function updateDiscordStatus(token, status) {
   });
 
   if (response.ok) {
-    console.log('Discord status updated:', text);
+    console.log(text ? 'Discord status updated:' : 'Discord status cleared:', text);
     return true;
   }
 
@@ -54,7 +50,8 @@ async function saveDiscordAutoUpdate(enabled) {
 
 async function getDiscordAutoUpdate() {
   const data = await getChromeStorage(STORAGE_KEYS.autoUpdate);
-  return data[STORAGE_KEYS.autoUpdate] !== false;
+  const enabled = data[STORAGE_KEYS.autoUpdate] !== false;
+  return enabled;
 }
 
 async function saveLatestLyrics(lyrics) {
@@ -92,9 +89,10 @@ async function discordRequest(token, path, options = {}) {
     const response = await fetch(`${DISCORD_API_BASE_URL}${path}`, fetchOptions);
     const data = await parseDiscordResponse(response);
 
-    return response.ok
+    const result = response.ok
       ? { ok: true, status: response.status, data }
       : { ok: false, status: response.status, error: data };
+    return result;
   } catch (error) {
     return {
       ok: false,

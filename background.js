@@ -5,18 +5,20 @@ importScripts('discord.js');
 
 const ACTIONS = {
   TRACK_CHANGED: 'trackChanged',
-  LYRIC_CHANGED: 'currentLyricChanged'
+  LYRIC_CHANGED: 'currentLyricChanged',
+  PLAYBACK_CHANGED: 'playbackChanged'
 };
 
 const MUSIC_NOTE_TEXT = '\u266a';
 const STATUS_PREFIX = MUSIC_NOTE_TEXT;
-const DISCORD_UPDATE_COOLDOWN_MS = 1500;
+const DISCORD_UPDATE_COOLDOWN_MS = 800;
 
 const discordState = {
   appliedStatus: undefined,
   pendingStatus: '',
   lastUpdateAt: 0,
   updateTimerId: null,
+  inFlightUpdate: null,
   forceNextLyricUpdate: true
 };
 
@@ -29,6 +31,12 @@ chrome.runtime.onMessage.addListener((message) => {
 
     case ACTIONS.LYRIC_CHANGED:
       handleLyricChanged(message);
+      break;
+
+    case ACTIONS.PLAYBACK_CHANGED:
+      if (!message.playing) {
+        clearDiscordStatus();
+      }
       break;
 
     default:
@@ -92,7 +100,16 @@ async function applyPendingDiscordStatus() {
       return;
     }
 
-    const updated = await updateDiscordStatus(credentials.token, status);
+    const updatePromise = updateDiscordStatus(credentials.token, status);
+    discordState.inFlightUpdate = updatePromise;
+    let updated;
+    try {
+      updated = await updatePromise;
+    } finally {
+      if (discordState.inFlightUpdate === updatePromise) {
+        discordState.inFlightUpdate = null;
+      }
+    }
 
     if (updated) {
       discordState.appliedStatus = status;
@@ -101,6 +118,42 @@ async function applyPendingDiscordStatus() {
     }
   } catch (error) {
     console.error('Error updating Discord status in background:', error);
+  }
+}
+
+async function clearDiscordStatus() {
+  clearScheduledDiscordUpdate();
+
+  if (!discordState.appliedStatus && !discordState.pendingStatus) {
+    return;
+  }
+
+  if (discordState.inFlightUpdate) {
+    try {
+      await discordState.inFlightUpdate;
+    } catch (error) {
+      console.error('Error waiting for Discord status update:', error);
+    }
+  }
+
+  discordState.pendingStatus = '';
+
+  try {
+    const credentials = await getDiscordCredentials();
+
+    if (!credentials) {
+      return;
+    }
+
+    const cleared = await updateDiscordStatus(credentials.token, '');
+
+    if (cleared) {
+      discordState.appliedStatus = '';
+      discordState.pendingStatus = '';
+      discordState.forceNextLyricUpdate = true;
+    }
+  } catch (error) {
+    console.error('Error clearing Discord status in background:', error);
   }
 }
 
